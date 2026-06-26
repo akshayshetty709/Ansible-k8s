@@ -1,0 +1,297 @@
+---
+# ════════════════════════════════════════════════════════════════════════════
+# Play 1 — Common setup (runs on ALL nodes)
+# ════════════════════════════════════════════════════════════════════════════
+- hosts: all
+  become: true
+  become_user: root
+  become_method: sudo
+  gather_facts: true
+  vars_files:
+    - vars.yml
+
+  tasks:
+
+    # ─── Swap ────────────────────────────────────────────────────────────────
+
+    - name: Disable swap (runtime)
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Remove swap entries from /etc/fstab (persists after reboot)
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    # ─── Kernel modules & sysctl ─────────────────────────────────────────────
+
+    - name: Load required kernel modules
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Persist kernel modules across reboots
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Set required sysctl parameters
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: yes
+        state: present
+        reload: yes
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables',  value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.ip_forward',                 value: '1' }
+
+    # ─── Docker + containerd ─────────────────────────────────────────────────
+
+    - name: Uninstall conflicting packages
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-doc
+          - docker-compose
+          - docker-compose-v2
+          - podman-docker
+          - containerd
+          - runc
+        state: absent
+        update_cache: yes
+
+    - name: Install prerequisite packages for Docker
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+
+    - name: Create /etc/apt/keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: Add Docker apt repository
+      ansible.builtin.shell: |
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+        https://download.docker.com/linux/ubuntu \
+        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        > /etc/apt/sources.list.d/docker.list
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
+
+    - name: Install Docker packages
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    # ─── cri-dockerd ─────────────────────────────────────────────────────────
+
+    - name: Download and install cri-dockerd binary
+      ansible.builtin.shell: |
+        wget -q https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz
+        tar xvf cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz
+        cp cri-dockerd/cri-dockerd /usr/local/bin/cri-dockerd
+        rm -rf cri-dockerd cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz
+      args:
+        creates: /usr/local/bin/cri-dockerd
+
+    - name: Download cri-dockerd systemd unit files
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/{{ item }}"
+        dest: /etc/systemd/system/{{ item }}
+        mode: '0644'
+      loop:
+        - cri-docker.service
+        - cri-docker.socket
+
+    - name: Fix cri-dockerd binary path in service file
+      ansible.builtin.replace:
+        path: /etc/systemd/system/cri-docker.service
+        regexp: '/usr/bin/cri-dockerd'
+        replace: '/usr/local/bin/cri-dockerd'
+
+    - name: Enable and start cri-dockerd
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      loop:
+        - cri-docker.service
+        - cri-docker.socket
+
+    # ─── Kubernetes packages ─────────────────────────────────────────────────
+
+    - name: Install prerequisite packages for Kubernetes
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+        state: present
+
+    - name: Download Kubernetes GPG key
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/Release.key |
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      ansible.builtin.lineinfile:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        line: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/ /"
+        state: present
+        create: yes
+
+    - name: Install kubeadm, kubelet, kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold Kubernetes packages at current version
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable and start kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Play 2 — Control-plane (master) setup
+# ════════════════════════════════════════════════════════════════════════════
+- hosts: k8s-master
+  become: true
+  gather_facts: false                   # ← FIXED: was yes, caused buffer overflow
+  vars_files:
+    - vars.yml
+
+  tasks:
+
+    - name: Initialize Kubernetes cluster with kubeadm
+      ansible.builtin.command: >
+        kubeadm init
+        --pod-network-cidr={{ pod_network_cidr }}
+        --apiserver-advertise-address={{ master_ip }}
+        --cri-socket=unix:///var/run/cri-dockerd.sock
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Create .kube directory for {{ k8s_user }}
+      ansible.builtin.file:
+        path: /home/{{ k8s_user }}/.kube
+        state: directory
+        mode: '0755'
+        owner: "{{ k8s_user }}"
+        group: "{{ k8s_user }}"
+
+    - name: Copy admin.conf to {{ k8s_user }} kubeconfig
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ k8s_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ k8s_user }}"
+        group: "{{ k8s_user }}"
+        mode: '0600'
+
+    - name: Install Calico tigera-operator
+      ansible.builtin.command: >
+        kubectl apply --force-conflicts --server-side -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
+      become_user: "{{ k8s_user }}"
+      environment:
+        KUBECONFIG: /home/{{ k8s_user }}/.kube/config
+
+    - name: Wait for tigera-operator deployment to be ready
+      ansible.builtin.command: >
+        kubectl wait --for=condition=available deployment/tigera-operator
+        -n tigera-operator --timeout=120s
+      become_user: "{{ k8s_user }}"
+      environment:
+        KUBECONFIG: /home/{{ k8s_user }}/.kube/config
+
+    - name: Apply Calico custom resources
+      ansible.builtin.command: >
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/custom-resources.yaml
+      become_user: "{{ k8s_user }}"
+      environment:
+        KUBECONFIG: /home/{{ k8s_user }}/.kube/config
+
+    - name: Generate kubeadm join command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: kubernetes_join_command
+
+    - name: Display join command
+      ansible.builtin.debug:
+        msg: "{{ kubernetes_join_command.stdout }}"
+
+    - name: Save join command (with cri-socket) to Ansible host
+      local_action:
+        module: copy
+        content: "{{ kubernetes_join_command.stdout }} --cri-socket=unix:///var/run/cri-dockerd.sock"
+        dest: /tmp/kubernetes_join_command
+        mode: '0600'
+      become: false
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Play 3 — Worker node setup
+# ════════════════════════════════════════════════════════════════════════════
+- hosts: k8s-workers
+  become: true
+  gather_facts: false                    # ← FIXED: was yes, caused buffer overflow
+  vars_files:
+    - vars.yml
+
+  tasks:
+
+    - name: Copy join command to worker node
+      ansible.builtin.copy:
+        src: /tmp/kubernetes_join_command
+        dest: /tmp/kubernetes_join_command
+        mode: '0700'
+
+    - name: Join worker node to the cluster
+      ansible.builtin.command: sh /tmp/kubernetes_join_command
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+      register: joined_or_not
+
+    - name: Node join status
+      ansible.builtin.debug:
+        msg: "{{ joined_or_not.stdout }}"
